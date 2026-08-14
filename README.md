@@ -13,8 +13,11 @@ MCP Apps（`io.modelcontextprotocol/ui` 扩展）让 MCP Server 在工具返回�
 - iframe 一片空白，CSP 静默拦掉了脚本
 - 一张搜索卡片理论上可以通过桥接调用「结账」「删单」等任意工具
 - 卡片 HTML 动辄几十 KB，一不小心就进了模型上下文，prompt cache 直接失效
+- 卡片渲染了但内容空白——旧版卡片 SDK 不把 `session_id` 转发到 `tools/call`，MCP Server 拒绝返回数据
+- 开发模式下 HMR 一刷新，已渲染的卡片全部消失
+- Gateway 进程挂了但 Electron 还活着，发消息完全没反应
 
-这个 Skill 把这些知识固化成一份 AI 可读的排查手册：完整数据流图、关键文件地图、两层安全防护的实现、6 个高频踩坑的症状与排查步骤，以及一份改完代码后的验证清单。
+这个 Skill 把这些知识固化成一份 AI 可读的排查手册：完整数据流图、关键文件地图、两层安全防护的实现、13 个高频踩坑的症状与排查步骤，以及一份改完代码后的验证清单。
 
 ## 什么时候会触发
 
@@ -44,10 +47,20 @@ Agent 检测到以下场景时会自动加载本 Skill：
 | **渲染管线** | 卡片为什么按 `result.ui` 而不是 `toolName` 派发；`ChainToolFallback` 中 7 项检查的正确顺序；⚠️ 退役渲染器 `thread.tsx` 的陷阱 |
 | **安全边界** | 沙箱 iframe 越权调用工具的攻击面 + 两层防护（前端传 `toolCallId` 做追溯、后端用 `_registered_tool_names` 做白名单校验）的完整代码 |
 | **卡片→模型通信** | `ui/update-model-context`（静默状态快照，作为下一条用户消息的不可见前缀）与 `ui/message`（触发新对话回合）的实现 |
-| **常见踩坑** | 6 个真实问题的症状 → 原因 → 排查步骤 |
-| **验证清单** | 8 项改完代码必须逐条确认的检查项，含前后端测试命令 |
+| **常见踩坑** | 13 个真实问题的症状 → 原因 → 排查步骤，含 session_id 注入、HMR 卡片持久化、Gateway 崩溃排查 |
+| **验证清单** | 12 项改完代码必须逐条确认的检查项，含前后端测试命令 |
 
 ## 安装
+
+### 方式一：npx skills（推荐）
+
+```bash
+npx skills add oriliz/mcp-apps-host-dev
+```
+
+支持 Claude Code、Codex、Cursor、Qoder 等 75+ agent。加 `-g` 全局安装，加 `-a claude-code` 指定目标 agent。
+
+### 方式二：手动克隆
 
 Skill 是一个包含 `SKILL.md` 的目录，放进 Agent 的 skills 目录即可，无需插件、无需配置。
 
@@ -95,8 +108,10 @@ apps/desktop/src/
   ├── components/assistant-ui/
   │   ├── thread/message-parts.tsx             # TS：★ 当前主力渲染派发器
   │   ├── thread.tsx                           # TS：⚠️ 退役渲染器，别往这加代码
-  │   └── mcp-app-card.tsx                     # TS：iframe + postMessage 桥接
-  └── store/mcp-app.ts                         # TS：卡片→模型通信通道
+  │   └── mcp-app-card.tsx                     # TS：iframe + postMessage 桥接 + session_id 注入
+  ├── lib/chat-messages.ts                     # TS：tool result 组装 + MCP UI 缓存持久化 (localStorage)
+  ├── store/mcp-app.ts                         # TS：卡片→模型通信通道
+  └── app/contrib/wiring.tsx                   # TS：★ 实际控制器（ 订阅）
 ```
 
 如果你在别的宿主应用里实现 MCP Apps，分层思路和安全边界依然通用（提取 → 暂存 → 事件下发 → iframe 渲染 → 桥接校验 → 执行真实调用），只需替换具体文件名与函数名。
