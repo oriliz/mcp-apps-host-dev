@@ -508,20 +508,40 @@ const client = new Client(
 
 **症状**：iframe 正常渲染了 MCP Apps 卡片的 UI（如搜索表单），但 Agent 工具调用的结果（如搜索到的商品列表）未在卡片内部展示。卡片只显示空白表单或搜索入口，用户在卡片内看不到 Agent 已搜索到的数据。
 
-**根因**：`ui/initialize` 握手时 `lastToolResult` 已传入 iframe（已验证 `hasLastToolResult: true`），但卡片内的 React 应用可能：
-1. 未实现从 `lastToolResult` 自动渲染初始数据的逻辑
-2. 或 `lastToolResult` 的数据格式与 React 应用期望的格式不匹配
-3. 或需要额外的 `ui/update-model-context` 消息触发渲染
+**根因**：`lastToolResult` 的数据格式与卡片 React 应用期望的格式不匹配。卡片 React 应用期望 `CallToolResult` 形状的对象（含 `.structuredContent` 属性），但 Host 传递的是 `content`（render 输出的文本数组）或裸 `structuredContent` 值，不含 `.structuredContent` 属性包装。
+
+UTP React 应用（"UCP Catalog v5.0.0"）的数据提取逻辑：
+```javascript
+// 先检查 t 本身是否有 products/product/line_items/orders
+if ("products" in t || ...) return t;
+// 再检查 t.structuredContent
+const n = t.structuredContent;  // ← 期望 .structuredContent 属性
+return n ? ("products" in n ? n : n.body ? n.body : ...) : null;
+```
 
 **与坑 #11 的区别**：坑 #11 是 `tools/call` 缺少 `session_id` 导致后续刷新失败；本坑是**初始渲染**就缺失——`ui/initialize` 的 `lastToolResult` 未被卡片 React 应用消费。
 
-**排查方法**：
-1. 在 `ui/initialize` handler 中 `console.log` 输出 `lastToolResult` 的结构和内容，确认数据已传入
-2. 检查卡片 React 应用是否监听 `ui/initialize` 响应中的 `lastToolResult` 字段
-3. 对比 MCP Server 返回的 `structuredContent` 格式与卡片 React 应用期望的数据结构
-4. 如果卡片不支持从 `lastToolResult` 渲染，考虑在 iframe 加载后主动通过 `ui/update-model-context` 推送工具结果
+**修复**：`presentationMeta()` 必须将工具结果包装为 `CallToolResult` 形状对象传递：
+```typescript
+// presentationMeta 返回值
+return {
+  mcpApp: ui,
+  lastToolResult: {
+    content: result.content,
+    ...(result.structuredContent !== undefined
+      ? { structuredContent: result.structuredContent }
+      : {}),
+  },
+}
+```
 
-**待解决**：UTP 的 "UCP Catalog v5.0.0" React 应用在 DSH 适配中存在此问题。已确认 `lastToolResult` 通过 `ui/initialize` 传入，但卡片仍显示空搜索表单。需进一步排查 React 应用是否消费了该数据。
+然后 `ui/initialize` handler 从 `meta.lastToolResult` 读取并传给 iframe：
+```typescript
+const meta = currentBlock.meta as { lastToolResult?: unknown } | undefined
+result.lastToolResult = meta?.lastToolResult ?? currentBlock.content
+```
+
+**已解决**：DSH 适配中已修复此问题（2026-08-20）。修复后卡片内成功渲染商品列表（名称、价格、销量、好评率等），不再是空表单。
 
 ## 验证清单
 
@@ -540,7 +560,7 @@ const client = new Client(
 - [ ] 在应用中实际渲染一张 MCP Apps 卡片，确认 iframe 显示、点击按钮能触发工具调用、卡片内数据完整（非空白）
 - [ ] 开发模式下触发 HMR 重载后，已渲染的卡片仍然存活
 - [ ] MCP 客户端声明了 `mimeTypes: ['text/html;profile=mcp-app']`（不只是扩展键）
-- [ ] `ui/initialize` 响应中的 `lastToolResult` 在卡片 React 应用内被消费渲染（非空白表单）
+- [ ] `ui/initialize` 响应中的 `lastToolResult` 是 `CallToolResult` 形状对象（含 `.structuredContent` 属性），卡片 React 应用内被消费渲染（非空白表单）
 
 ## Reference Implementation: Hermes Desktop
 
