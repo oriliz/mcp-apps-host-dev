@@ -1,7 +1,7 @@
 ---
 name: mcp-apps-host-dev
 description: Use when developing or debugging the MCP Apps host layer in any agent application — rendering sandboxed iframe cards, bridging postMessage ↔ gateway ↔ MCP server, or fixing security/architectural issues in the card pipeline. Covers the full bridge architecture, security model, and common pitfalls. Includes Hermes Desktop as a reference implementation.
-version: 2.0.0
+version: 2.1.0
 author: ori
 license: MIT
 platforms: [macos, linux, windows]
@@ -480,6 +480,49 @@ curl -s --max-time 10 "<base_url>/chat/completions" \
 
 **修复**：杀掉残留前端进程后重启。如果 API 端点本身不稳定，考虑配置 `request_timeout` 或使用更稳定的 provider。
 
+### 14. MCP 客户端未声明 `mimeTypes` → 工具定义中 `_meta` 被清除
+
+**症状**：`tools/list` 返回的工具定义中 `_meta.ui` 字段为空，导致 referenced-form 卡片无法渲染（iframe 不出现）。Agent 回复正常（文本工具结果不受影响），但看不到任何 MCP Apps 卡片。
+
+**根因**：某些 MCP Server（如 UTP CLI v0.6.15）的 `supportsMCPApps()` 函数不仅检查客户端是否声明了 `io.modelcontextprotocol/ui` 扩展键，还要求扩展数据中包含 `mimeTypes` 数组且含 `"text/html;profile=mcp-app"`。只发送空对象 `{}` 不够——Server 会认为客户端不支持 MCP Apps，清除所有工具定义的 `_meta`。
+
+**修复**：MCP 客户端初始化时，扩展声明中必须包含 `mimeTypes`：
+
+```typescript
+const client = new Client(
+  { name: 'my-host', version: '0.0.1' },
+  { capabilities: {
+      extensions: {
+        'io.modelcontextprotocol/ui': {
+          mimeTypes: ['text/html;profile=mcp-app']  // ← 必须
+        }
+      }
+    } 
+  },
+)
+```
+
+**排查方法**：写一个独立的 MCP 客户端测试脚本，直接通过 stdio 连接 MCP Server，发 `tools/list`，检查返回的工具是否含 `_meta`。如果 0 个工具含 `_meta`，说明 Server 认为客户端不支持 UI 扩展——检查 `mimeTypes` 是否声明。UTP Server 源码参考：`internal/mcp/server.go` 的 `supportsMCPApps()` 函数。
+
+### 15. 卡片渲染成功但工具结果未在卡片内展示
+
+**症状**：iframe 正常渲染了 MCP Apps 卡片的 UI（如搜索表单），但 Agent 工具调用的结果（如搜索到的商品列表）未在卡片内部展示。卡片只显示空白表单或搜索入口，用户在卡片内看不到 Agent 已搜索到的数据。
+
+**根因**：`ui/initialize` 握手时 `lastToolResult` 已传入 iframe（已验证 `hasLastToolResult: true`），但卡片内的 React 应用可能：
+1. 未实现从 `lastToolResult` 自动渲染初始数据的逻辑
+2. 或 `lastToolResult` 的数据格式与 React 应用期望的格式不匹配
+3. 或需要额外的 `ui/update-model-context` 消息触发渲染
+
+**与坑 #11 的区别**：坑 #11 是 `tools/call` 缺少 `session_id` 导致后续刷新失败；本坑是**初始渲染**就缺失——`ui/initialize` 的 `lastToolResult` 未被卡片 React 应用消费。
+
+**排查方法**：
+1. 在 `ui/initialize` handler 中 `console.log` 输出 `lastToolResult` 的结构和内容，确认数据已传入
+2. 检查卡片 React 应用是否监听 `ui/initialize` 响应中的 `lastToolResult` 字段
+3. 对比 MCP Server 返回的 `structuredContent` 格式与卡片 React 应用期望的数据结构
+4. 如果卡片不支持从 `lastToolResult` 渲染，考虑在 iframe 加载后主动通过 `ui/update-model-context` 推送工具结果
+
+**待解决**：UTP 的 "UCP Catalog v5.0.0" React 应用在 DSH 适配中存在此问题。已确认 `lastToolResult` 通过 `ui/initialize` 传入，但卡片仍显示空搜索表单。需进一步排查 React 应用是否消费了该数据。
+
 ## 验证清单
 
 修改 MCP Apps Host 代码后，检查以下项目：
@@ -496,6 +539,8 @@ curl -s --max-time 10 "<base_url>/chat/completions" \
 - [ ] 单元测试通过（前端 + 后端）
 - [ ] 在应用中实际渲染一张 MCP Apps 卡片，确认 iframe 显示、点击按钮能触发工具调用、卡片内数据完整（非空白）
 - [ ] 开发模式下触发 HMR 重载后，已渲染的卡片仍然存活
+- [ ] MCP 客户端声明了 `mimeTypes: ['text/html;profile=mcp-app']`（不只是扩展键）
+- [ ] `ui/initialize` 响应中的 `lastToolResult` 在卡片 React 应用内被消费渲染（非空白表单）
 
 ## Reference Implementation: Hermes Desktop
 
@@ -518,3 +563,21 @@ python -m pytest tests/tools/test_mcp_apps_ui.py -x
 ```
 
 在其他 Agent 应用中实现 MCP Apps Host 时，按以上角色创建对应模块，分层思路和安全边界直接复用。
+
+### Reference Implementation: DeepSeek Harness (DSH)
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 是一个 Cordis 插件化运行时的 Agent 应用。MCP Apps Host 通过插件包 `@deepseek-ai/dsh-mcp-apps-host` 实现，不修改 DSH 核心代码。
+
+| 角色 | 文件 | 语言 |
+|---|---|---|
+| Extraction Layer + Bridge Handler | `packages/mcp/mcp-apps-host/src/index.ts` | TypeScript |
+| Card Component | `packages/mcp/mcp-apps-host/src/client/McpAppCard.tsx` | TSX |
+| Slot Registration + sendUserMessage | `packages/mcp/mcp-apps-host/src/client/index.ts` | TypeScript |
+| Profile Overlay (连接配置) | `mcp-apps-utp.patch.yml` | YAML |
+
+**DSH 特有的扩展点**：
+- `ctx.webServer.register()`: 注册 HTTP 路由 (`/mcp-apps/<server>/bridge`)，用于 postMessage 桥接
+- `presentationMeta()` 函数: 从工具执行结果的 `_meta.ui` 投射到 `result.meta.mcpApp`，流经 `ToolResultNode.meta` 到客户端 React 组件
+- `tool.call.toolview` slot: 按 `mcp__<serverName>__<toolName>` key 注册自定义 React 视图
+
+**DSH 适配中踩过的坑**：#14（mimeTypes 未声明）、#15（工具结果未在卡片内渲染）
