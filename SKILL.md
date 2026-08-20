@@ -276,7 +276,7 @@ function buildCsp(csp: McpUiCsp): string {
 
 **关键约束**：
 
-- `img-src` 只放行 `data: blob:` 和 `resourceDomains` 中的域名。如果卡片 HTML 引用了外部图片（如 CDN 商品图），其域名**必须**在 `_meta.ui.csp.resourceDomains` 中声明，否则图片将被 CSP 静默阻挡。
+- `img-src` 放行 `data: blob: https:` 和 `resourceDomains` 中的域名。DSH 默认包含 `https:` 以支持 CDN 商品图片（参见坑 #17）。如果需要更严格的限制，在 `_meta.ui.csp.resourceDomains` 中声明具体域名。
 - `connect-src` 默认为 `'none'`（sandbox iframe 无 `allow-same-origin`，`'self'` 无意义）。卡片需要发起网络请求（fetch/WebSocket）时，其域名**必须**在 `connectDomains` 中声明。
 - `script-src` 默认 `'unsafe-inline' 'unsafe-eval'`——卡片 HTML 中的内联脚本可以执行，但外部脚本文件需要 `scriptSrc` 额外声明。
 
@@ -543,6 +543,49 @@ result.lastToolResult = meta?.lastToolResult ?? currentBlock.content
 
 **已解决**：DSH 适配中已修复此问题（2026-08-20）。修复后卡片内成功渲染商品列表（名称、价格、销量、好评率等），不再是空表单。
 
+### 坑 #16：readSessionId 未使用 structuredContent 路径
+
+**现象**：P1 修复后 `meta.lastToolResult.structuredContent` 已可用，但 `readSessionId()` 仍仅从 `block.content` 文本解析 JSON 查找 `session_id`。当 content 文本不是纯 JSON（如含可读前缀），parse 失败 → `session_id` 注入失败 → 卡片内加购物车/结算等操作断掉。
+
+**根因**：P1 修复改了数据通道（`presentationMeta` → `meta.lastToolResult`），但 `readSessionId` 没跟着更新读取路径。
+
+**修复**：`readSessionId()` 优先从 `meta.lastToolResult.structuredContent.session_id` 读取，回退到 content 文本解析：
+```typescript
+const meta = block.meta as { lastToolResult?: { structuredContent?: Record<string, unknown> } } | undefined
+const sc = meta?.lastToolResult?.structuredContent
+if (sc && typeof sc === 'object') {
+  if (typeof sc.session_id === 'string') return sc.session_id
+  if (typeof sc.sessionId === 'string') return sc.sessionId
+}
+// Fallback: parse JSON from content text blocks...
+```
+
+**已解决**：DSH 适配中已修复此问题（2026-08-20）。
+
+### 坑 #17：CSP img-src 阻断外部商品图片
+
+**现象**：iframe CSP `img-src data: blob:` 仅允许 data/blob URI，阻断所有 CDN 外部商品图片（如 alicdn.com 上的商品图）。
+
+**根因**：`buildCsp()` 默认 `img-src` 不包含 `https:` 协议，且 MCP Server 可能不在 `_meta.ui.csp.resourceDomains` 中声明图片域名。
+
+**修复**：`buildCsp()` 默认 `img-src` 添加 `https:`：`img-src data: blob: https:`。
+
+**已解决**：DSH 适配中已修复此问题（2026-08-20）。
+
+### 坑 #18：ui/update-model-context 未实现（TODO 桁留）
+
+**现象**：`ui/update-model-context` handler 仅 `console.debug` 后丢弃上下文文本，从未暂存或注入到后续消息中。卡片发送的上下文更新（如搜索关键词、筛选条件）被完全丢弃。
+
+**根因**：初始实现标记为 TODO，未完成暂存逻辑。
+
+**修复**：
+1. 新增 `_stagedContext` Map，按 callId 暂存上下文文本
+2. `ui/update-model-context` handler 写入 `_stagedContext.set(callId, text)`
+3. `ui/message` handler 读取并前置到消息文本前发送，发送后清除
+4. 组件卸载时清理 `_stagedContext` 条目
+
+**已解决**：DSH 适配中已修复此问题（2026-08-20）。
+
 ## 验证清单
 
 修改 MCP Apps Host 代码后，检查以下项目：
@@ -561,6 +604,9 @@ result.lastToolResult = meta?.lastToolResult ?? currentBlock.content
 - [ ] 开发模式下触发 HMR 重载后，已渲染的卡片仍然存活
 - [ ] MCP 客户端声明了 `mimeTypes: ['text/html;profile=mcp-app']`（不只是扩展键）
 - [ ] `ui/initialize` 响应中的 `lastToolResult` 是 `CallToolResult` 形状对象（含 `.structuredContent` 属性），卡片 React 应用内被消费渲染（非空白表单）
+- [ ] `readSessionId` 优先从 `meta.lastToolResult.structuredContent.session_id` 读取，回退到 content 文本解析
+- [ ] CSP `img-src` 包含 `https:` 以放行外部 CDN 图片
+- [ ] `ui/update-model-context` 上下文暂存到 `_stagedContext` Map，在下次 `ui/message` 时前置注入并清除
 
 ## Reference Implementation: Hermes Desktop
 
@@ -600,4 +646,4 @@ python -m pytest tests/tools/test_mcp_apps_ui.py -x
 - `presentationMeta()` 函数: 从工具执行结果的 `_meta.ui` 投射到 `result.meta.mcpApp`，流经 `ToolResultNode.meta` 到客户端 React 组件
 - `tool.call.toolview` slot: 按 `mcp__<serverName>__<toolName>` key 注册自定义 React 视图
 
-**DSH 适配中踩过的坑**：#14（mimeTypes 未声明）、#15（工具结果未在卡片内渲染）
+**DSH 适配中踩过的坑**：#14（mimeTypes 未声明）、#15（工具结果未在卡片内渲染）、#16（readSessionId 未用 structuredContent 路径）、#17（CSP img-src 阻断外部图片）、#18（ui/update-model-context 未实现）
